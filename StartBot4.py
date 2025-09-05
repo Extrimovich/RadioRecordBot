@@ -20,33 +20,45 @@ STATION_NAMES = [name for name, url in RADIO_STATIONS]
 STATION_URLS = dict(RADIO_STATIONS)
 
 player_state = {}  # guild_id: {"station_idx": int, "paused": bool}
+guild_locks = {}   # guild_id: asyncio.Lock
+
+def get_guild_lock(guild_id: int) -> asyncio.Lock:
+    lock = guild_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        guild_locks[guild_id] = lock
+    return lock
 
 class RadioControlView(discord.ui.View):
-    def __init__(self, guild_id):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.guild_id = guild_id
 
     @discord.ui.button(label="⏮️ Предыдущая", style=discord.ButtonStyle.primary, custom_id="prev_station")
     async def prev_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
         await handle_switch_station(interaction, -1)
 
     @discord.ui.button(label="⏸️ Пауза", style=discord.ButtonStyle.secondary, custom_id="pause_station")
     async def pause_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
         await handle_pause_resume(interaction, pause=True)
 
     @discord.ui.button(label="▶️ Продолжить", style=discord.ButtonStyle.secondary, custom_id="resume_station")
     async def resume_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
         await handle_pause_resume(interaction, pause=False)
 
     @discord.ui.button(label="⏹️ Стоп", style=discord.ButtonStyle.danger, custom_id="stop_station")
     async def stop_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
         await handle_stop(interaction)
 
     @discord.ui.button(label="⏭️ Следующая", style=discord.ButtonStyle.primary, custom_id="next_station")
     async def next_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(thinking=True)
         await handle_switch_station(interaction, 1)
 
-# Вспомогательная функция для подключения к voice с обработкой ошибок и followup
+# Вспомогательная функция для подключения к voice с повторными попытками
 async def ensure_voice(interaction):
     if not interaction.user.voice or not interaction.user.voice.channel:
         # После defer только followup!
@@ -58,9 +70,18 @@ async def ensure_voice(interaction):
         if voice_client:
             if voice_client.channel != voice_channel:
                 await voice_client.move_to(voice_channel)
-        else:
-            voice_client = await voice_channel.connect(timeout=20)
-        return voice_client
+            return voice_client
+        # Повторяем несколько попыток подключения
+        last_exc = None
+        for _ in range(3):
+            try:
+                voice_client = await asyncio.wait_for(voice_channel.connect(timeout=15), timeout=20)
+                return voice_client
+            except Exception as exc:  # noqa: PERF203
+                last_exc = exc
+                await asyncio.sleep(1.5)
+        if last_exc:
+            raise last_exc
     except Exception as e:
         await interaction.followup.send(f"Ошибка подключения: {type(e).__name__}: {e}", ephemeral=True)
         return None
@@ -68,60 +89,68 @@ async def ensure_voice(interaction):
 async def start_radio(interaction, station_idx):
     guild_id = interaction.guild.id
     name, radio_url = RADIO_STATIONS[station_idx]
-    voice_client = await ensure_voice(interaction)
-    if not voice_client:
-        return
+    async with get_guild_lock(guild_id):
+        voice_client = await ensure_voice(interaction)
+        if not voice_client:
+            return
 
-    player_state[guild_id] = {"station_idx": station_idx, "paused": False}
+        player_state[guild_id] = {"station_idx": station_idx, "paused": False}
 
-    if voice_client.is_playing():
-        voice_client.stop()
-    ffmpeg_options = {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": "-vn"
-    }
-    try:
-        source = discord.FFmpegPCMAudio(radio_url, **ffmpeg_options)
-        voice_client.play(source)
-    except Exception as e:
-        await interaction.followup.send(f"Не удалось запустить поток: {type(e).__name__}: {e}", ephemeral=True)
-        return
-    view = RadioControlView(guild_id)
-    await interaction.followup.send(
-        f"🎶 Сейчас играет Radio Record: **{name}**",
-        view=view,
-        ephemeral=False
-    )
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+        ffmpeg_options = {
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +nobuffer -flags low_delay -probesize 32k -analyzeduration 0",
+            "options": "-vn -bufsize 256k"
+        }
+        try:
+            source = discord.FFmpegPCMAudio(radio_url, **ffmpeg_options)
+
+            def after_playback(error):
+                if error:
+                    bot.loop.call_soon_threadsafe(asyncio.create_task, interaction.followup.send(f"Поток прерван: {error}", ephemeral=True))
+
+            voice_client.play(source, after=after_playback)
+        except Exception as e:
+            await interaction.followup.send(f"Не удалось запустить поток: {type(e).__name__}: {e}", ephemeral=True)
+            return
+        view = RadioControlView()
+        await interaction.followup.send(
+            f"🎶 Сейчас играет Radio Record: **{name}**",
+            view=view,
+            ephemeral=False
+        )
 
 async def switch_radio(interaction, direction):
     guild_id = interaction.guild.id
     state = player_state.get(guild_id)
     if state is None:
-        await interaction.response.edit_message(content="Ничего не играет.", view=None)
+        await interaction.followup.send("Ничего не играет.", ephemeral=True)
         return
     idx = (state["station_idx"] + direction) % len(RADIO_STATIONS)
     name, radio_url = RADIO_STATIONS[idx]
     voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
     if not voice_client:
-        await interaction.response.edit_message(content="Бот не подключен к голосовому каналу.", view=None)
+        await interaction.followup.send("Бот не подключен к голосовому каналу.", ephemeral=True)
         return
-    if voice_client.is_playing():
-        voice_client.stop()
-    ffmpeg_options = {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": "-vn"
-    }
-    try:
-        source = discord.FFmpegPCMAudio(radio_url, **ffmpeg_options)
-        voice_client.play(source)
-    except Exception as e:
-        await interaction.response.edit_message(content=f"Не удалось запустить поток: {type(e).__name__}: {e}", view=None)
-        return
-    player_state[guild_id]["station_idx"] = idx
-    await interaction.response.edit_message(
-        content=f"🎶 Сейчас играет Radio Record: **{name}**",
-        view=RadioControlView(guild_id)
-    )
+    async with get_guild_lock(guild_id):
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+        ffmpeg_options = {
+            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +nobuffer -flags low_delay -probesize 32k -analyzeduration 0",
+            "options": "-vn -bufsize 256k"
+        }
+        try:
+            source = discord.FFmpegPCMAudio(radio_url, **ffmpeg_options)
+            voice_client.play(source)
+        except Exception as e:
+            await interaction.followup.edit_message(message_id=interaction.message.id, content=f"Не удалось запустить поток: {type(e).__name__}: {e}", view=None)
+            return
+        player_state[guild_id]["station_idx"] = idx
+        await interaction.followup.edit_message(
+            message_id=interaction.message.id,
+            content=f"🎶 Сейчас играет Radio Record: **{name}**",
+            view=RadioControlView()
+        )
 
 async def handle_switch_station(interaction, direction):
     await switch_radio(interaction, direction)
@@ -131,42 +160,47 @@ async def handle_pause_resume(interaction, pause=True):
     voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
     state = player_state.get(guild_id)
     if not voice_client or not state:
-        await interaction.response.edit_message(content="Сейчас ничего не играет.", view=None)
+        await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
         return
-    if pause:
-        if voice_client.is_playing():
-            voice_client.pause()
-            state["paused"] = True
-            await interaction.response.edit_message(
-                content=f"⏸️ Воспроизведение на паузе: **{RADIO_STATIONS[state['station_idx']][0]}**",
-                view=RadioControlView(guild_id)
-            )
+    async with get_guild_lock(guild_id):
+        if pause:
+            if voice_client.is_playing():
+                voice_client.pause()
+                state["paused"] = True
+                await interaction.followup.edit_message(
+                    message_id=interaction.message.id,
+                    content=f"⏸️ Воспроизведение на паузе: **{RADIO_STATIONS[state['station_idx']][0]}**",
+                    view=RadioControlView()
+                )
+            else:
+                await interaction.followup.send("Поток уже на паузе.", ephemeral=True)
         else:
-            await interaction.response.send_message("Поток уже на паузе.", ephemeral=True)
-    else:
-        if voice_client.is_paused():
-            voice_client.resume()
-            state["paused"] = False
-            await interaction.response.edit_message(
-                content=f"▶️ Воспроизведение продолжено: **{RADIO_STATIONS[state['station_idx']][0]}**",
-                view=RadioControlView(guild_id)
-            )
-        else:
-            await interaction.response.send_message("Поток уже играет.", ephemeral=True)
+            if voice_client.is_paused():
+                voice_client.resume()
+                state["paused"] = False
+                await interaction.followup.edit_message(
+                    message_id=interaction.message.id,
+                    content=f"▶️ Воспроизведение продолжено: **{RADIO_STATIONS[state['station_idx']][0]}**",
+                    view=RadioControlView()
+                )
+            else:
+                await interaction.followup.send("Поток уже играет.", ephemeral=True)
 
 async def handle_stop(interaction):
     guild_id = interaction.guild.id
     voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
-    if voice_client:
-        voice_client.stop()
-        await voice_client.disconnect(force=True)
-        await interaction.response.edit_message(
-            content="⏹️ Воспроизведение остановлено и бот покинул канал.",
-            view=None
-        )
-    else:
-        await interaction.response.edit_message(content="Сейчас ничего не играет.", view=None)
-    player_state.pop(guild_id, None)
+    async with get_guild_lock(guild_id):
+        if voice_client:
+            voice_client.stop()
+            await voice_client.disconnect(force=True)
+            await interaction.followup.edit_message(
+                message_id=interaction.message.id,
+                content="⏹️ Воспроизведение остановлено и бот покинул канал.",
+                view=None
+            )
+        else:
+            await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
+        player_state.pop(guild_id, None)
 
 @bot.event
 async def on_ready():
@@ -176,6 +210,11 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s).")
     except Exception as e:
         print(f"Sync error: {e}")
+    # Регистрируем постоянное представление для кнопок (persistent view)
+    try:
+        bot.add_view(RadioControlView())
+    except Exception as e:
+        print(f"Add persistent view error: {e}")
 
 @bot.tree.command(name="play", description="Включить станцию Radio Record в голосовом канале")
 @app_commands.describe(station="Название станции (например: record, russian_mix, ...)")
