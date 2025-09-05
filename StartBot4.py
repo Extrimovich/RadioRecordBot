@@ -14,6 +14,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 RADIO_STATIONS = [
     ("record", "https://radiorecord.hostingradio.ru/rr_main96.aacp"),
     ("russian_mix", "https://radiorecord.hostingradio.ru/rus64.aacp"),
+    ("pirate_station", "https://radiorecord.hostingradio.ru/ps96.aacp"),
+    ("liquid_funk", "https://radiorecord.hostingradio.ru/liquidfunk96.aacp"),
+    ("colbas_ceh", "https://radiorecord.hostingradio.ru/pump96.aacp")
     # ... добавьте другие станции!
 ]
 STATION_NAMES = [name for name, url in RADIO_STATIONS]
