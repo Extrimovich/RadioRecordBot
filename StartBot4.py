@@ -35,27 +35,27 @@ class RadioControlView(discord.ui.View):
 
     @discord.ui.button(label="⏮️ Предыдущая", style=discord.ButtonStyle.primary, custom_id="prev_station")
     async def prev_station(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         await handle_switch_station(interaction, -1)
 
     @discord.ui.button(label="⏸️ Пауза", style=discord.ButtonStyle.secondary, custom_id="pause_station")
     async def pause_station(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         await handle_pause_resume(interaction, pause=True)
 
     @discord.ui.button(label="▶️ Продолжить", style=discord.ButtonStyle.secondary, custom_id="resume_station")
     async def resume_station(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         await handle_pause_resume(interaction, pause=False)
 
     @discord.ui.button(label="⏹️ Стоп", style=discord.ButtonStyle.danger, custom_id="stop_station")
     async def stop_station(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         await handle_stop(interaction)
 
     @discord.ui.button(label="⏭️ Следующая", style=discord.ButtonStyle.primary, custom_id="next_station")
     async def next_station(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         await handle_switch_station(interaction, 1)
 
 # Вспомогательная функция для подключения к voice с повторными попытками
@@ -219,7 +219,7 @@ async def on_ready():
 @bot.tree.command(name="play", description="Включить станцию Radio Record в голосовом канале")
 @app_commands.describe(station="Название станции (например: record, russian_mix, ...)")
 async def play_radio(interaction: discord.Interaction, station: str = "record"):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     if station.lower() not in STATION_URLS:
         available = ", ".join(STATION_URLS.keys())
         await interaction.followup.send(
@@ -244,7 +244,7 @@ async def station_autocomplete(interaction: discord.Interaction, current: str):
 
 @bot.tree.command(name="stations", description="Показать все доступные станции Radio Record")
 async def list_stations(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     station_list = "\n".join(f"- `{name}`" for name in STATION_NAMES)
     await interaction.followup.send(
         f"**Доступные станции:**\n{station_list}",
@@ -253,7 +253,7 @@ async def list_stations(interaction: discord.Interaction):
 
 @bot.tree.command(name="nowplaying", description="Показать, какая станция сейчас играет")
 async def now_playing(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     guild_id = interaction.guild.id
     state = player_state.get(guild_id)
     if state is not None:
