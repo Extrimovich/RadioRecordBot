@@ -37,13 +37,34 @@ async def ensure_http_session():
     return http_session
 
 def _parse_icy_metadata_block(block: bytes) -> str | None:
+    """Extract and decode StreamTitle from ICY metadata block bytes.
+
+    Strategy:
+    - Work on bytes and extract raw title bytes via regex
+    - Try UTF-8 first (most modern streams)
+    - Then CP1251 (many RU streams)
+    - Finally Latin-1 as a last resort
+    """
     try:
-        text = block.decode("latin-1", errors="ignore")
-        match = re.search(r"StreamTitle='([^']*)'", text)
-        if match:
-            title = match.group(1).strip()
-            if title:
-                return title
+        trimmed = block.rstrip(b"\x00")
+        match = re.search(rb"StreamTitle='(.*?)';", trimmed, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        raw = match.group(1)
+        for enc in ("utf-8", "cp1251", "latin-1"):
+            try:
+                title = raw.decode(enc).strip()
+                if title:
+                    return title
+            except Exception:
+                continue
+        # Heuristic recovery path
+        try:
+            fallback = raw.decode("latin-1", errors="ignore").encode("latin-1", errors="ignore").decode("utf-8", errors="ignore").strip()
+            if fallback:
+                return fallback
+        except Exception:
+            pass
     except Exception:
         pass
     return None
