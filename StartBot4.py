@@ -4,6 +4,8 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 import asyncio
+import aiohttp
+import re
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
@@ -25,6 +27,131 @@ STATION_URLS = dict(RADIO_STATIONS)
 player_state = {}  # guild_id: {"station_idx": int, "paused": bool}
 guild_locks = {}   # guild_id: asyncio.Lock
 control_messages = {}  # guild_id: {"channel_id": int, "message_id": int}
+http_session = None  # type: ignore[assignment]
+track_updater_task = None  # type: ignore[assignment]
+
+async def ensure_http_session():
+    global http_session
+    if http_session is None or http_session.closed:  # type: ignore[attr-defined]
+        http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+    return http_session
+
+def _parse_icy_metadata_block(block: bytes) -> str | None:
+    """Extract and decode StreamTitle from ICY metadata block bytes.
+
+    Strategy:
+    - Work on bytes and extract raw title bytes via regex
+    - Try UTF-8 first (most modern streams)
+    - Then CP1251 (many RU streams)
+    - Finally Latin-1 as a last resort
+    """
+    try:
+        trimmed = block.rstrip(b"\x00")
+        match = re.search(rb"StreamTitle='(.*?)';", trimmed, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        raw = match.group(1)
+        for enc in ("utf-8", "cp1251", "latin-1"):
+            try:
+                title = raw.decode(enc).strip()
+                if title:
+                    return title
+            except Exception:
+                continue
+        # Heuristic recovery path
+        try:
+            fallback = raw.decode("latin-1", errors="ignore").encode("latin-1", errors="ignore").decode("utf-8", errors="ignore").strip()
+            if fallback:
+                return fallback
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+async def fetch_icy_title(stream_url: str) -> str | None:
+    try:
+        session = await ensure_http_session()
+        headers = {"Icy-MetaData": "1", "User-Agent": "DiscordBot/1.0 (+ICY)"}
+        async with session.get(stream_url, headers=headers) as resp:
+            metaint_header = resp.headers.get("icy-metaint") or resp.headers.get("Icy-MetaInt")
+            if not metaint_header:
+                return None
+            try:
+                metaint = int(metaint_header)
+            except Exception:
+                return None
+            # Drain up to the first metadata block
+            remaining = metaint
+            while remaining > 0:
+                chunk = await resp.content.read(min(remaining, 4096))
+                if not chunk:
+                    return None
+                remaining -= len(chunk)
+            # Length of metadata comes in blocks of 16 bytes
+            length_byte = await resp.content.read(1)
+            if not length_byte:
+                return None
+            meta_len = length_byte[0] * 16
+            if meta_len == 0:
+                return None
+            meta_block = await resp.content.read(meta_len)
+            if not meta_block:
+                return None
+            return _parse_icy_metadata_block(meta_block)
+    except Exception:
+        return None
+
+def _compose_presence_text(state: dict) -> str:
+    station_name = STATION_NAMES[state["station_idx"]]
+    track_title = state.get("track")
+    paused = state.get("paused", False)
+    if track_title:
+        base = f"{station_name}: {track_title}"
+    else:
+        base = f"{station_name}"
+    if paused:
+        base = f"⏸️ {base}"
+    else:
+        base = f"🎶 {base}"
+    # Discord shows up to ~128 chars; trim just in case
+    if len(base) > 128:
+        base = base[:125] + "..."
+    return base
+
+async def update_presence_for_guild(guild_id: int):
+    try:
+        state = player_state.get(guild_id)
+        if not state:
+            await bot.change_presence(activity=None)
+            return
+        activity = discord.Activity(type=discord.ActivityType.listening, name=_compose_presence_text(state))
+        await bot.change_presence(activity=activity, status=discord.Status.online)
+    except Exception:
+        pass
+
+async def track_updater_loop():
+    # Periodically fetch ICY metadata for playing stations and update presence
+    while True:
+        try:
+            # Snapshot to avoid runtime dict size change issues
+            items = list(player_state.items())
+            for guild_id, state in items:
+                if state.get("paused", False):
+                    continue
+                try:
+                    name, url = RADIO_STATIONS[state["station_idx"]]
+                except Exception:
+                    continue
+                title = await fetch_icy_title(url)
+                if title and state.get("track") != title:
+                    state["track"] = title
+                    await update_presence_for_guild(guild_id)
+                await asyncio.sleep(1.0)
+        except Exception:
+            # Never break the loop on error
+            pass
+        await asyncio.sleep(30)
 
 def get_guild_lock(guild_id: int) -> asyncio.Lock:
     lock = guild_locks.get(guild_id)
@@ -142,7 +269,7 @@ async def start_radio(interaction, station_idx):
         if not voice_client:
             return
 
-        player_state[guild_id] = {"station_idx": station_idx, "paused": False}
+        player_state[guild_id] = {"station_idx": station_idx, "paused": False, "track": None}
 
         if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
@@ -171,6 +298,10 @@ async def start_radio(interaction, station_idx):
         )
         try:
             control_messages[guild_id] = {"channel_id": msg.channel.id, "message_id": msg.id}
+        except Exception:
+            pass
+        try:
+            await update_presence_for_guild(guild_id)
         except Exception:
             pass
 
@@ -202,6 +333,7 @@ async def switch_radio(interaction, direction):
             await interaction.followup.edit_message(message_id=target_id, content=f"Не удалось запустить поток: {type(e).__name__}: {e}", view=None)
             return
         player_state[guild_id]["station_idx"] = idx
+        player_state[guild_id]["track"] = None
         ref = control_messages.get(guild_id)
         target_id = ref["message_id"] if ref else interaction.message.id
         await interaction.followup.edit_message(
@@ -209,6 +341,10 @@ async def switch_radio(interaction, direction):
             content=f"🎶 Сейчас играет Radio Record: **{name}**",
             view=RadioControlView()
         )
+        try:
+            await update_presence_for_guild(guild_id)
+        except Exception:
+            pass
 
 async def handle_switch_station(interaction, direction):
     await switch_radio(interaction, direction)
@@ -232,6 +368,10 @@ async def handle_pause_resume(interaction, pause=True):
                     content=f"⏸️ Воспроизведение на паузе: **{RADIO_STATIONS[state['station_idx']][0]}**",
                     view=RadioControlView()
                 )
+                try:
+                    await update_presence_for_guild(guild_id)
+                except Exception:
+                    pass
             else:
                 await interaction.followup.send("Поток уже на паузе.", ephemeral=True)
         else:
@@ -245,6 +385,10 @@ async def handle_pause_resume(interaction, pause=True):
                     content=f"▶️ Воспроизведение продолжено: **{RADIO_STATIONS[state['station_idx']][0]}**",
                     view=RadioControlView()
                 )
+                try:
+                    await update_presence_for_guild(guild_id)
+                except Exception:
+                    pass
             else:
                 await interaction.followup.send("Поток уже играет.", ephemeral=True)
 
@@ -261,6 +405,10 @@ async def handle_stop(interaction):
         else:
             await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
         player_state.pop(guild_id, None)
+        try:
+            await bot.change_presence(activity=None)
+        except Exception:
+            pass
 
 @bot.event
 async def on_ready():
@@ -270,6 +418,17 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s).")
     except Exception as e:
         print(f"Sync error: {e}")
+    # Start background tasks
+    try:
+        await ensure_http_session()
+    except Exception:
+        pass
+    global track_updater_task
+    if track_updater_task is None or track_updater_task.done():  # type: ignore[union-attr]
+        try:
+            track_updater_task = asyncio.create_task(track_updater_loop())
+        except Exception:
+            pass
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -330,5 +489,32 @@ async def now_playing(interaction: discord.Interaction):
         await interaction.followup.send(text, ephemeral=False)
     else:
         await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
+
+@bot.tree.command(name="track", description="Показать текущий трек станции")
+async def current_track(interaction: discord.Interaction):
+    await interaction.response.defer()
+    guild_id = interaction.guild.id
+    state = player_state.get(guild_id)
+    if not state:
+        await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
+        return
+    name = STATION_NAMES[state["station_idx"]]
+    title = state.get("track")
+    if not title and not state.get("paused", False):
+        try:
+            _, url = RADIO_STATIONS[state["station_idx"]]
+            title = await fetch_icy_title(url)
+            if title:
+                state["track"] = title
+                try:
+                    await update_presence_for_guild(guild_id)
+                except Exception:
+                    pass
+        except Exception:
+            title = None
+    if title:
+        await interaction.followup.send(f"🎧 Трек: **{title}** (станция: `{name}`)", ephemeral=False)
+    else:
+        await interaction.followup.send(f"Текущий трек недоступен. Станция: `{name}`", ephemeral=True)
 
 bot.run(DISCORD_TOKEN)
