@@ -24,6 +24,7 @@ STATION_URLS = dict(RADIO_STATIONS)
 
 player_state = {}  # guild_id: {"station_idx": int, "paused": bool}
 guild_locks = {}   # guild_id: asyncio.Lock
+control_messages = {}  # guild_id: {"channel_id": int, "message_id": int}
 
 def get_guild_lock(guild_id: int) -> asyncio.Lock:
     lock = guild_locks.get(guild_id)
@@ -32,32 +33,76 @@ def get_guild_lock(guild_id: int) -> asyncio.Lock:
         guild_locks[guild_id] = lock
     return lock
 
+async def delete_control_message(guild_id: int):
+    ref = control_messages.get(guild_id)
+    if not ref:
+        return
+    channel = bot.get_channel(ref["channel_id"])  # type: ignore[arg-type]
+    try:
+        if channel is None:
+            channel = await bot.fetch_channel(ref["channel_id"])  # type: ignore[assignment]
+        message = await channel.fetch_message(ref["message_id"])  # type: ignore[attr-defined]
+        await message.delete()
+    except Exception:
+        pass
+    finally:
+        control_messages.pop(guild_id, None)
+
+async def ensure_is_current_control(interaction: discord.Interaction) -> bool:
+    guild_id = interaction.guild.id
+    ref = control_messages.get(guild_id)
+    if not ref or interaction.message.id != ref["message_id"]:
+        try:
+            await interaction.response.send_message(
+                "Это устаревшее сообщение управления. Используйте последнее сообщение от бота.",
+                ephemeral=True
+            )
+        except Exception:
+            pass
+        try:
+            if interaction.message and interaction.message.author == bot.user:
+                await interaction.message.delete()
+        except Exception:
+            pass
+        return False
+    return True
+
 class RadioControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="⏮️ Предыдущая", style=discord.ButtonStyle.primary, custom_id="prev_station")
     async def prev_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await ensure_is_current_control(interaction):
+            return
         await interaction.response.defer()
         await handle_switch_station(interaction, -1)
 
     @discord.ui.button(label="⏸️ Пауза", style=discord.ButtonStyle.secondary, custom_id="pause_station")
     async def pause_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await ensure_is_current_control(interaction):
+            return
         await interaction.response.defer()
         await handle_pause_resume(interaction, pause=True)
 
     @discord.ui.button(label="▶️ Продолжить", style=discord.ButtonStyle.secondary, custom_id="resume_station")
     async def resume_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await ensure_is_current_control(interaction):
+            return
         await interaction.response.defer()
         await handle_pause_resume(interaction, pause=False)
 
     @discord.ui.button(label="⏹️ Стоп", style=discord.ButtonStyle.danger, custom_id="stop_station")
     async def stop_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await ensure_is_current_control(interaction):
+            return
         await interaction.response.defer()
         await handle_stop(interaction)
 
     @discord.ui.button(label="⏭️ Следующая", style=discord.ButtonStyle.primary, custom_id="next_station")
     async def next_station(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await ensure_is_current_control(interaction):
+            return
         await interaction.response.defer()
         await handle_switch_station(interaction, 1)
 
@@ -116,12 +161,18 @@ async def start_radio(interaction, station_idx):
         except Exception as e:
             await interaction.followup.send(f"Не удалось запустить поток: {type(e).__name__}: {e}", ephemeral=True)
             return
+        # Удаляем предыдущее сообщение управления, если было
+        await delete_control_message(guild_id)
         view = RadioControlView()
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             f"🎶 Сейчас играет Radio Record: **{name}**",
             view=view,
             ephemeral=False
         )
+        try:
+            control_messages[guild_id] = {"channel_id": msg.channel.id, "message_id": msg.id}
+        except Exception:
+            pass
 
 async def switch_radio(interaction, direction):
     guild_id = interaction.guild.id
@@ -146,11 +197,15 @@ async def switch_radio(interaction, direction):
             source = discord.FFmpegPCMAudio(radio_url, **ffmpeg_options)
             voice_client.play(source)
         except Exception as e:
-            await interaction.followup.edit_message(message_id=interaction.message.id, content=f"Не удалось запустить поток: {type(e).__name__}: {e}", view=None)
+            ref = control_messages.get(guild_id)
+            target_id = ref["message_id"] if ref else interaction.message.id
+            await interaction.followup.edit_message(message_id=target_id, content=f"Не удалось запустить поток: {type(e).__name__}: {e}", view=None)
             return
         player_state[guild_id]["station_idx"] = idx
+        ref = control_messages.get(guild_id)
+        target_id = ref["message_id"] if ref else interaction.message.id
         await interaction.followup.edit_message(
-            message_id=interaction.message.id,
+            message_id=target_id,
             content=f"🎶 Сейчас играет Radio Record: **{name}**",
             view=RadioControlView()
         )
@@ -170,8 +225,10 @@ async def handle_pause_resume(interaction, pause=True):
             if voice_client.is_playing():
                 voice_client.pause()
                 state["paused"] = True
+                ref = control_messages.get(guild_id)
+                target_id = ref["message_id"] if ref else interaction.message.id
                 await interaction.followup.edit_message(
-                    message_id=interaction.message.id,
+                    message_id=target_id,
                     content=f"⏸️ Воспроизведение на паузе: **{RADIO_STATIONS[state['station_idx']][0]}**",
                     view=RadioControlView()
                 )
@@ -181,8 +238,10 @@ async def handle_pause_resume(interaction, pause=True):
             if voice_client.is_paused():
                 voice_client.resume()
                 state["paused"] = False
+                ref = control_messages.get(guild_id)
+                target_id = ref["message_id"] if ref else interaction.message.id
                 await interaction.followup.edit_message(
-                    message_id=interaction.message.id,
+                    message_id=target_id,
                     content=f"▶️ Воспроизведение продолжено: **{RADIO_STATIONS[state['station_idx']][0]}**",
                     view=RadioControlView()
                 )
@@ -196,11 +255,9 @@ async def handle_stop(interaction):
         if voice_client:
             voice_client.stop()
             await voice_client.disconnect(force=True)
-            await interaction.followup.edit_message(
-                message_id=interaction.message.id,
-                content="⏹️ Воспроизведение остановлено и бот покинул канал.",
-                view=None
-            )
+            # Удаляем сообщение управления и не оставляем следов в канале
+            await delete_control_message(guild_id)
+            await interaction.followup.send("⏹️ Воспроизведение остановлено, бот покинул канал.", ephemeral=True)
         else:
             await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
         player_state.pop(guild_id, None)
@@ -213,11 +270,16 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s).")
     except Exception as e:
         print(f"Sync error: {e}")
-    # Регистрируем постоянное представление для кнопок (persistent view)
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Если сам бот покинул голосовой канал, удаляем сообщение управления
     try:
-        bot.add_view(RadioControlView())
-    except Exception as e:
-        print(f"Add persistent view error: {e}")
+        if member.bot and bot.user and member.id == bot.user.id:
+            if before.channel and not after.channel and member.guild:
+                await delete_control_message(member.guild.id)
+    except Exception:
+        pass
 
 @bot.tree.command(name="play", description="Включить станцию Radio Record в голосовом канале")
 @app_commands.describe(station="Название станции (например: record, russian_mix, ...)")
