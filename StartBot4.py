@@ -26,9 +26,10 @@ STATION_URLS = dict(RADIO_STATIONS)
 
 player_state = {}  # guild_id: {"station_idx": int, "paused": bool}
 guild_locks = {}   # guild_id: asyncio.Lock
-control_messages = {}  # guild_id: {"channel_id": int, "message_id": int}
+control_messages = {}  # guild_id: {"channel_id": int, "message_id": int, "last_content": str}
 http_session = None  # type: ignore[assignment]
 track_updater_task = None  # type: ignore[assignment]
+control_refresh_task = None  # type: ignore[assignment]
 
 async def ensure_http_session():
     global http_session
@@ -119,6 +120,14 @@ def _compose_presence_text(state: dict) -> str:
         base = base[:125] + "..."
     return base
 
+def compose_control_content(state: dict) -> str:
+    station_name = STATION_NAMES[state["station_idx"]]
+    paused = state.get("paused", False)
+    header = f"⏸️ Воспроизведение на паузе: **{station_name}**" if paused else f"▶️ Воспроизведение продолжено: **{station_name}**"
+    track_title = state.get("track")
+    track_line = f"🎧 Трек: **{track_title}**" if track_title else "🎧 Трек: —"
+    return f"{header}\n{track_line}"
+
 async def update_presence_for_guild(guild_id: int):
     try:
         state = player_state.get(guild_id)
@@ -145,13 +154,49 @@ async def track_updater_loop():
                     continue
                 title = await fetch_icy_title(url)
                 if title and state.get("track") != title:
+                    # Update current track and push to history
                     state["track"] = title
+                    history = state.get("history") or []
+                    if not history or history[-1] != title:
+                        history.append(title)
+                        if len(history) > 20:
+                            history = history[-20:]
+                        state["history"] = history
                     await update_presence_for_guild(guild_id)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.2)
         except Exception:
             # Never break the loop on error
             pass
-        await asyncio.sleep(30)
+        await asyncio.sleep(5)
+
+async def control_refresh_loop():
+    # Periodically refresh the control message to show the latest track
+    while True:
+        try:
+            refs = list(control_messages.items())
+            for guild_id, ref in refs:
+                state = player_state.get(guild_id)
+                if not state:
+                    continue
+                try:
+                    channel = bot.get_channel(ref["channel_id"])  # type: ignore[arg-type]
+                    if channel is None:
+                        channel = await bot.fetch_channel(ref["channel_id"])  # type: ignore[assignment]
+                    content = compose_control_content(state)
+                    if ref.get("last_content") == content:
+                        continue
+                    message = await channel.fetch_message(ref["message_id"])  # type: ignore[attr-defined]
+                    await message.edit(content=content)
+                    ref["last_content"] = content
+                except Exception:
+                    try:
+                        await delete_control_message(guild_id)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.2)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
 
 def get_guild_lock(guild_id: int) -> asyncio.Lock:
     lock = guild_locks.get(guild_id)
@@ -269,7 +314,7 @@ async def start_radio(interaction, station_idx):
         if not voice_client:
             return
 
-        player_state[guild_id] = {"station_idx": station_idx, "paused": False, "track": None}
+        player_state[guild_id] = {"station_idx": station_idx, "paused": False, "track": None, "history": []}
 
         if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
@@ -291,13 +336,10 @@ async def start_radio(interaction, station_idx):
         # Удаляем предыдущее сообщение управления, если было
         await delete_control_message(guild_id)
         view = RadioControlView()
-        msg = await interaction.followup.send(
-            f"🎶 Сейчас играет Radio Record: **{name}**",
-            view=view,
-            ephemeral=False
-        )
+        content = compose_control_content(player_state[guild_id])
+        msg = await interaction.followup.send(content, view=view, ephemeral=False)
         try:
-            control_messages[guild_id] = {"channel_id": msg.channel.id, "message_id": msg.id}
+            control_messages[guild_id] = {"channel_id": msg.channel.id, "message_id": msg.id, "last_content": content}
         except Exception:
             pass
         try:
@@ -334,13 +376,13 @@ async def switch_radio(interaction, direction):
             return
         player_state[guild_id]["station_idx"] = idx
         player_state[guild_id]["track"] = None
+        player_state[guild_id]["history"] = []
         ref = control_messages.get(guild_id)
         target_id = ref["message_id"] if ref else interaction.message.id
-        await interaction.followup.edit_message(
-            message_id=target_id,
-            content=f"🎶 Сейчас играет Radio Record: **{name}**",
-            view=RadioControlView()
-        )
+        new_content = compose_control_content(player_state[guild_id])
+        await interaction.followup.edit_message(message_id=target_id, content=new_content, view=RadioControlView())
+        if ref is not None:
+            ref["last_content"] = new_content
         try:
             await update_presence_for_guild(guild_id)
         except Exception:
@@ -363,11 +405,9 @@ async def handle_pause_resume(interaction, pause=True):
                 state["paused"] = True
                 ref = control_messages.get(guild_id)
                 target_id = ref["message_id"] if ref else interaction.message.id
-                await interaction.followup.edit_message(
-                    message_id=target_id,
-                    content=f"⏸️ Воспроизведение на паузе: **{RADIO_STATIONS[state['station_idx']][0]}**",
-                    view=RadioControlView()
-                )
+                await interaction.followup.edit_message(message_id=target_id, content=compose_control_content(state), view=RadioControlView())
+                if ref is not None:
+                    ref["last_content"] = compose_control_content(state)
                 try:
                     await update_presence_for_guild(guild_id)
                 except Exception:
@@ -380,11 +420,10 @@ async def handle_pause_resume(interaction, pause=True):
                 state["paused"] = False
                 ref = control_messages.get(guild_id)
                 target_id = ref["message_id"] if ref else interaction.message.id
-                await interaction.followup.edit_message(
-                    message_id=target_id,
-                    content=f"▶️ Воспроизведение продолжено: **{RADIO_STATIONS[state['station_idx']][0]}**",
-                    view=RadioControlView()
-                )
+                new_content = compose_control_content(state)
+                await interaction.followup.edit_message(message_id=target_id, content=new_content, view=RadioControlView())
+                if ref is not None:
+                    ref["last_content"] = new_content
                 try:
                     await update_presence_for_guild(guild_id)
                 except Exception:
@@ -427,6 +466,12 @@ async def on_ready():
     if track_updater_task is None or track_updater_task.done():  # type: ignore[union-attr]
         try:
             track_updater_task = asyncio.create_task(track_updater_loop())
+        except Exception:
+            pass
+    global control_refresh_task
+    if control_refresh_task is None or control_refresh_task.done():  # type: ignore[union-attr]
+        try:
+            control_refresh_task = asyncio.create_task(control_refresh_loop())
         except Exception:
             pass
 
@@ -516,5 +561,23 @@ async def current_track(interaction: discord.Interaction):
         await interaction.followup.send(f"🎧 Трек: **{title}** (станция: `{name}`)", ephemeral=False)
     else:
         await interaction.followup.send(f"Текущий трек недоступен. Станция: `{name}`", ephemeral=True)
+
+@bot.tree.command(name="history", description="Показать историю треков текущей станции")
+async def track_history(interaction: discord.Interaction):
+    await interaction.response.defer()
+    guild_id = interaction.guild.id
+    state = player_state.get(guild_id)
+    if not state:
+        await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
+        return
+    station_name = STATION_NAMES[state["station_idx"]]
+    history = state.get("history") or []
+    if not history:
+        await interaction.followup.send(f"История пуста для станции `{station_name}`.", ephemeral=True)
+        return
+    last_items = history[-10:]
+    lines = [f"{idx+1}. {title}" for idx, title in enumerate(last_items)]
+    msg = f"**История треков для `{station_name}` (последние {len(last_items)}):**\n" + "\n".join(lines)
+    await interaction.followup.send(msg, ephemeral=False)
 
 bot.run(DISCORD_TOKEN)
