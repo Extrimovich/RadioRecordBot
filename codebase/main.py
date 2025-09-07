@@ -17,7 +17,6 @@ RADIO_STATIONS = [
     ("record", "https://radiorecord.hostingradio.ru/rr_main96.aacp"),
     ("russian_mix", "https://radiorecord.hostingradio.ru/rus64.aacp"),
     ("hits-all-time", "https://radiorecord.hostingradio.ru/alltimers96.aacp"),
-    ("disco90s", "https://radiorecord.hostingradio.ru/sd9096.aacp"),
     ("russian_hits", "https://radiorecord.hostingradio.ru/russianhits96.aacp"),
     ("colbas_ceh", "https://radiorecord.hostingradio.ru/pump96.aacp"),
     ("festivals", "https://radiorecord.hostingradio.ru/livedjsets96.aacp"),
