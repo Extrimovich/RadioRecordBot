@@ -16,9 +16,19 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 RADIO_STATIONS = [
     ("record", "https://radiorecord.hostingradio.ru/rr_main96.aacp"),
     ("russian_mix", "https://radiorecord.hostingradio.ru/rus64.aacp"),
+    ("hits-all-time", "https://radiorecord.hostingradio.ru/alltimers96.aacp"),
+    ("disco90s", "https://radiorecord.hostingradio.ru/sd9096.aacp"),
+    ("russian_hits", "https://radiorecord.hostingradio.ru/russianhits96.aacp"),
+    ("colbas_ceh", "https://radiorecord.hostingradio.ru/pump96.aacp"),
+    ("festivals", "https://radiorecord.hostingradio.ru/livedjsets96.aacp"),
+    ("deep", "https://radiorecord.hostingradio.ru/deep96.aacp"),
+    ("chill-out", "https://radiorecord.hostingradio.ru/chil96.aacp"),
+    ("shashliki", "https://radiorecord.hostingradio.ru/nashashlyki96.aacp"),
+    ("megamix", "https://radiorecord.hostingradio.ru/mix96.aacp"),
     ("pirate_station", "https://radiorecord.hostingradio.ru/ps96.aacp"),
-    ("liquid_funk", "https://radiorecord.hostingradio.ru/liquidfunk96.aacp"),
-    ("colbas_ceh", "https://radiorecord.hostingradio.ru/pump96.aacp")
+    ("rock", "https://radiorecord.hostingradio.ru/rock96.aacp"),
+    ("liquid_funk", "https://radiorecord.hostingradio.ru/liquidfunk96.aacp")
+
     # ... добавьте другие станции!
 ]
 STATION_NAMES = [name for name, url in RADIO_STATIONS]
@@ -167,7 +177,7 @@ async def track_updater_loop():
         except Exception:
             # Never break the loop on error
             pass
-        await asyncio.sleep(5)
+        await asyncio.sleep(1)
 
 async def control_refresh_loop():
     # Periodically refresh the control message to show the latest track
