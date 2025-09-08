@@ -127,7 +127,7 @@ RADIO_STATIONS = [
     ("moombahton", "https://radiorecord.hostingradio.ru/mmbt96.aacp"),
     ("2step", "https://radiorecord.hostingradio.ru/2step96.aacp"),
     ("complextro", "https://radiorecord.hostingradio.ru/complextro96.aacp"),
-    ("groove/tribal", "https://radiorecord.hostingradio.ru/groovetribal96.aacp"),
+    ("groove/tribal", "https://radiorecord.hostingradio.ru/groovetribal96.aacp")
 
 
 
