@@ -128,7 +128,7 @@ RADIO_STATIONS = [
     ("2step", "https://radiorecord.hostingradio.ru/2step96.aacp"),
     ("complextro", "https://radiorecord.hostingradio.ru/complextro96.aacp"),
     ("groove/tribal", "https://radiorecord.hostingradio.ru/groovetribal96.aacp"),
-    ("custom_radio", "https://localhost:8000/stream.aacp")
+    ("custom_radio", "http://aacp-radio:8000/stream.aacp")
 
 
 
